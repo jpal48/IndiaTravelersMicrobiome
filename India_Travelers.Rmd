@@ -1,0 +1,812 @@
+---
+title: "India Travelers"
+author: "Jacob Palenchar"
+date: "9 April 2022"
+output:
+  prettydoc::html_pretty:
+    toc: TRUE
+    theme: architect
+    highlight: github
+bibliography: /home/palencj/Oyster/palencj_refrences.bib
+csl: /home/palencj/CSL_Styles/nucleic-acids-research.csl
+---
+
+```{r Clock,echo=FALSE}
+StartTime<-proc.time()
+```
+
+# Load Packages
+
+```{r Packages,eval=TRUE,message=FALSE}
+require(dada2)
+require(dplyr)
+require(ggplot2)
+require(phyloseq)
+require(knitr)
+require(kableExtra)
+require(microbiome)
+require(vegan)
+require(ape)
+require(betapart)
+```
+
+
+# India Travelers
+
+Travelling to India can be hazardous
+
+There is a prevalence of antibiotic resistant bacteria in India and the intestines of travelers to India are often colonized with new bacteria. Extended-spectrum cephalosporin-resistant Enterobacteriaceae is known to be one of these resistant bacteria families to colonize healthy individuals traveling to areas of high prevalence. The 16S rRNA of the microbiomes of 40 travelers' guts at different time points will be analyzed. We will check to see if the microbiome diversity of colonized individuals was affected.
+
+The data has been deposited with links to BioProject accession number PRJEB23775 in the NCBI BioProject database. 
+[@india]
+
+## How many samples?
+
+There are 170 total samples. 
+
+# Begin Data Processing
+
+## Establish File Paths
+
+Here, we establish where to retrieve the files (SeqPath) and create a character vector with each file path (SeqFiles), then separate them into forward (Read1) and reverse (Read2) reads. Read 1 files are denoted with a "_1" while read 2 files are denoted with a "_2", this is how they will be separated.
+
+```{r SeqFiles,eval=TRUE}
+SeqPath<-file.path("/opt/Genomics/India_Travelers_Microbiota/fastq")
+SeqFiles<-sort(list.files(SeqPath,full.names=T))
+Read1<-grep(pattern="_1",x=SeqFiles,fixed=T,perl=F) 
+Read2<-grep(pattern="_2",x=SeqFiles,fixed=T,perl=F)
+```
+
+## Trim and Filter Reads
+
+Now we need to do some quality control with the reads. We will pick 6 random integers and plot the quality of their reads from the forward and reverse read vectors. This will give us an indication of where we need to trim. This function, **plotQualityProfile()**, like most of the ones in this section are from the *dada2* package. [@dada2]
+
+
+```{r QC,eval=TRUE}
+PickSix<-sample(x=length(Read1),replace=F,size=6)
+plotQualityProfile(SeqFiles[Read1[PickSix]])+ggtitle("Read1")
+plotQualityProfile(SeqFiles[Read2[PickSix]])+ggtitle("Read2")
+```
+
+Based on these graphs I will trim the forward reads $R1<=190$ and the reverse reads $10<=R2<=175$. On the reverse reads I will trim the 5' end about 10 nucleotides.
+
+
+### Output File 
+
+We need a directory to output the filtered reads. This creates one if it doesn't exist.
+
+```{r MakeOutPutDir,eval=TRUE}
+FiltPath<-file.path("~/Biol_441/HomeWorks/IndiaTravsOP")
+if (dir.exists(FiltPath) ) {
+  paste("File Exists, and data will be overwritten!!!")
+} else {
+  print(paste("No output file, but one will be created."))
+  dir.create(FiltPath)
+}
+```
+
+### Finally we will actually filter the reads! 
+
+Trim the reads: $R1<=190$ and $10<=R2<=175$ respectively.
+
+```{r FilterEm,eval=TRUE}
+Read1F<-file.path(FiltPath,basename(SeqFiles[Read1]))
+Read2F<-file.path(FiltPath,basename(SeqFiles[Read2]))
+MyTime<-proc.time()
+FiltResults<-filterAndTrim(fwd = SeqFiles[Read1],
+                           filt=Read1F,
+                           rev=SeqFiles[Read2],
+                           filt.rev=Read2F,
+                           truncLen=c(190,175), # Take seq off 3' ends
+                           maxEE=c(2,2),
+                           multithread=4
+                          )
+paste("Finish filtering and trimming samples in",
+     as.integer((proc.time()-MyTime)[["elapsed"]]),
+     "seconds.",
+     sep=" ")
+```
+
+### Rerunning quality control
+
+To make sure the reads look quality after trimming we will replot our random 12 reads. 
+
+```{r reQC,eval=TRUE}
+plotQualityProfile(Read1F[PickSix])+ggtitle("Read1 Trimmed")
+plotQualityProfile(Read2F[PickSix])+ggtitle("Read2 Trimmed")
+```
+
+## Learn Errors
+
+The **learnErrors()** function will be run to estimate the frequency of sequencing errors. 
+
+```{r GetLearnt,eval=TRUE}
+MyTime<-proc.time()
+Read1Errors<-learnErrors(fls=Read1F,MAX_CONSIST=20,multithread=4)
+Read2Errors<-learnErrors(fls=Read2F,MAX_CONSIST=20,multithread=4)
+paste("Finish learning errors in",
+     as.integer((proc.time()-MyTime)[["elapsed"]]),
+     "seconds.",
+     sep=" ")
+save(Read1Errors,file="/home/palencj/Biol_441/HomeWorks/Read1Errors.RObj")
+save(Read2Errors,file="/home/palencj/Biol_441/HomeWorks/Read2Errors.RObj")
+
+```
+
+### Plot the Error Rates
+
+In order to verify that the error rates have been reasonably well estimated, the fit between the observed error rates and (black points), and the fitted error rates (black lines) should be inspected.
+
+```{r PlotErr,eval=TRUE}
+plotErrors(dq=Read1Errors)
+plotErrors(dq=Read2Errors)
+```
+
+## Dereplicate the Sequences
+
+The next step in the analysis is to import the filtered sequences into R whilst dereplicating them! During replication, we condense the data down a lot. By collapsing together all the reads that encode the same exact sequence. The exact duplicates will be removed, merging their quality scores. 
+
+```{r DeRep,eval=TRUE}
+Read1DeRep<-derepFastq(fls=Read1F,verbose=F)
+Read2DeRep<-derepFastq(fls=Read2F,verbose=F)
+```
+
+### Rename the Samples
+
+The names of the files need to be cleaned up to use for the column names; they are currently in a character vector with the whole file path, we just want the sample names. 
+  + Split the string paths by "/"
+  + Create an object with the sample file's name's only
+  + Remove the "_.fastq.gz" from the sample names
+
+```{r CreateNames,eval=TRUE}
+SampleNames<-strsplit(Read1F,split="/",fixed=T,perl=F)
+Derp<-unlist(SampleNames)
+Names2<-Derp[seq(from=5,to=850,by=5)]
+Names3<-gsub(Names2,pattern="_1.fastq.gz",replacement="",fixed=T)
+names(Read1DeRep)<-Names3
+names(Read2DeRep)<-Names3
+rm(SampleNames,Derp,Names2)
+```
+
+### Find Ribosomal Sequence Variants
+
+The core method of the *dada2* is sample inference; this means figuring out which samples have which variants. Sometimes this step is called "denoising". 
+
+```{r DeNoising,eval=TRUE}
+Read1Dada<-dada(Read1DeRep,err=Read1Errors,verbose=0,multithread=4)
+Read2Dada<-dada(Read2DeRep,err=Read2Errors,verbose=0,multithread=4)
+```
+
+### Merge Reads
+
+The reads now need to be merged. Function **mergePairs()** will merge the denoised forward and reverse reads that have enough overlap.
+
+```{r Merge,eval=TRUE}
+MergedReads<-mergePairs(dadaF=Read1Dada,
+                       derepF=Read1DeRep,
+                       dadaR=Read2Dada,
+                       derepR=Read2DeRep,
+                       verbose=F)
+rm(Read1DeRep,Read2DeRep)
+```
+
+## Ribosomal Sequence Variants
+
+The RSV table is basically a matrix, where the row names are the samples, and the column names are the sequence variants discovered by *dada2*.
+
+```{r RSVTable,eval=TRUE}
+SeqTable<-makeSequenceTable(samples=MergedReads)
+dim(SeqTable)
+```
+
+### Analysis of RSV Lengths
+
+So how long are the RSVs? We are expecting 291 nucleotides. Actually, because of trimming they will probably be a little less. They are not the same length because some prokaryotes have slightly longer or shorter V4 regions.
+
+```{r SeqLenDistr,eval=TRUE}
+table(nchar(getSequences(SeqTable)))
+```
+
+This selects the RSVs at the appropriate lengths we want to analyze, 290-293. 
+
+```{r SelectLengthDistr,eval=TRUE}
+SeqTable<-SeqTable[,nchar(colnames(SeqTable)) %in% seq(290,293)] # selects only RSVs from 290 to 293
+```
+
+## Remove the Chimeras
+
+Chimeras are sequences introduced by PCR that are not part of the sequence we desire and must be removed. (stnc= seq table with no chimeras)
+
+```{r CreateNoChim,eval=TRUE}
+stnc<-removeBimeraDenovo(SeqTable,method="consensus",multithread=4,verbose=F)
+dim(stnc)
+save(stnc,file="/home/palencj/Biol_441/HomeWorks/India_stnc.RObj")
+```
+
+The number of samples has been conserved, however there are a great many less RSVs.
+
+## Summary of Read Processing
+
+We will make a kable using *knitr* and *kableExtra* summarizing our reads from step to step.
+[@knitr] [@kableEx]
+
+```{r CreateKab,eval=TRUE}
+getN<-function(x) sum(getUniques(x))
+track<-cbind(FiltResults,
+             sapply(X=Read1Dada,FUN=getN),
+             sapply(X=Read2Dada,FUN=getN),
+             sapply(X=MergedReads,FUN=getN),
+             rowSums(stnc))
+colnames(track)<-c("Input","Filtered","DenoisedF","DenoisedR","Merged","Non-chimeric")
+rownames(track)<-Names3
+# PDF: xtable, HTML: kable
+kable_styling(kable_input=kable(track),
+              bootstrap_options=c("striped","hover","condensed"),
+              full_width=F)
+rm(FiltResults,Read1Dada,Read2Dada,track)
+```
+
+## Produce Taxonomy Table
+
+Here the taxonomy will be assigned to each of the RSV's discovered in the samples.
+We are going to use training sets from SilvaDB and *dada2* to assign the taxonomy. [@silva]
+
+We will also assign the species for the sequences that can be discerned to that level. 
+
+```{r CreateTaxonomy,eval=TRUE}
+Taxa<-assignTaxonomy(seqs=stnc,refFasta="/opt/SilvaDB/v132/silva_nr_v132_train_set.fa.gz",multithread=3)
+
+taxa<-addSpecies(taxtab=Taxa,
+                 refFasta="/opt/SilvaDB/v132/silva_species_assignment_v132.fa.gz")
+save(taxa,file="/home/palencj/Biol_441/HomeWorks/IT_Taxa_W_Species.RObj")
+```
+
+This concludes the *dada2* portion of the workflow. 
+
+## Import Phenotype Table
+
+The phenotable contains all the independent variables that are pertinent to the experiment, such as the time point relative to their trip, if the traveler had been to SE Asia, if they took antibiotics, if they had abdominal pain, and if their gut was colonized. The table was made in excel and imported as a CSV file. We need to set the rownames as the values in the first column, then remove that column. 
+
+```{r LoadPhentable,eval=TRUE}
+PhenoCsv<-read.csv("/home/palencj/Biol_441/HomeWorks/India Phenotype Table.csv")
+rownames(PhenoCsv)<-PhenoCsv[,1]
+PhenoCsv<-PhenoCsv[,-1]
+```
+
+# Analysis with Phyloseq
+
+We now turn to the *phyloseq* package to perform further analysis on our microbial community data. [@phyloseq]
+
+This will construct a phyloseq object with the *dada2* STNC, Taxa table and the Phenotable.
+
+
+
+```{r PhyloseqObject,eval=TRUE}
+PS<-phyloseq(otu_table(object=stnc,taxa_are_rows=F),
+             sample_data(object=PhenoCsv),
+             tax_table(object=taxa))
+save(PS,file="/home/palencj/Biol_441/HomeWorks/India_PS.RObj")
+rm(stnc,PhenoCsv,taxa)
+```
+
+
+```{r}
+load(file="/home/palencj/Biol_441/HomeWorks/India_PS.RObj")
+```
+
+
+## Examine Mocks
+
+Now we will pull the mocks, HV1 and HV2, out of the sample and list the genus's found and their frequencies. 
+
+```{r Mock}
+Mock<-subset_samples(PS, TravelerID %in% c("HV1","HV2"))
+MockNotZero<-prune_taxa(x=Mock,taxa_sums(Mock)>0)
+
+kable(table(tax_table(MockNotZero)[,"Genus"]),col.names=c("Genus","Frequency"))
+```
+
+These are the details of the Mock PS object:
+
+```{r MockPS}
+Mock
+```
+
+These are the details of the Mock that had frequencies higher than 0.
+
+```{r MockNotZeroPS}
+MockNotZero
+```
+
+There was a big drop in the number of taxa but there's still 8 samples and 7 taxonomy ranks.
+
+The mocks look good, so they will be removed from the phyloseq object.
+
+```{r ByeByeMock,eval=TRUE}
+PS<-subset_samples(PS, TravelerID != "HV1"& TravelerID != "HV2")
+PS
+```
+
+There are 8 less samples but the number of taxa is the same. 
+
+## Investigate Read Depth
+
+The *ggplot2* package was used to create the histograms showing the breakdown of sequencing depth. [@ggplot2]
+
+This will model the sequencing depth of the non-chimeric reads. It should have a bell shape. 
+
+```{r SampleSeqDepth,eval=TRUE}
+sample_sum_df<-data.frame(Sums=sample_sums(PS))
+ggplot(data=sample_sum_df, aes(x=Sums)) +
+  geom_histogram(color="black",fill="dodger blue",binwidth=1250) +
+  ggtitle("Distribution of Sample Sequencing Depth") +
+  xlab("Non-Chimeric Reads") +
+  theme(axis.title.y=element_blank())
+```
+
+This looks good but to be sure, any sequences with less than 1500 nonchimeric reads will be removed. 
+
+```{r RemoveShallowSamples,eval=TRUE}
+PS<-prune_samples(x=PS,samples=(sample_sums(PS)>1500))
+PS
+```
+
+
+## Display the Data
+
+### General Diversity
+
+It will help to visualize the data. 
+
+Here is a pie chart of all the phyla. The phylum that contains the Enterobacteriaceae is Proteobacteria. 
+
+```{r PiePhyla1,eval=TRUE,fig.height=7}
+MyPhyla<-as.data.frame(table(tax_table(PS)[,"Phylum"]))
+colnames(MyPhyla)<-c("Phylum","Frequency")
+BP<-ggplot(data=MyPhyla, aes(x="",y=Frequency,fill=Phylum)) +
+  geom_bar(width=1,stat="identity")
+MyPie<-BP+coord_polar("y",start=0)+theme(axis.title.y=element_blank())
+MyPie
+```
+
+This is a pie chart of all the orders found in the PS object. Enterobacteriales is the order of concern. 
+
+```{r PieOrder1,eval=TRUE,fig.height=6,fig.width=10}
+MyOrder<-as.data.frame(table(tax_table(PS)[,"Order"]))
+colnames(MyOrder)<-c("Order","Frequency")
+BP<-ggplot(data=MyOrder, aes(x="",y=Frequency,fill=Order)) +
+  geom_bar(width=0.5,stat="identity")
+MyPie<-BP+coord_polar("y",start=0)+theme(axis.title.y=element_blank())
+MyPie
+```
+
+With so much diversity in the microbiomes, these pie charts are not super useful, especially as the taxonomic ranks get more specific. 
+
+Here is a graph showing the overall phyla diversity based on the antibiotic status.
+
+```{r StackedBarplot1,eval=TRUE,fig.height=8,fig.width=8}
+Stack<-tax_glom(physeq=PS,taxrank="Phylum")
+Stack<-transform_sample_counts(physeq=Stack,fun=function(x) {x/sum(x)})
+Stack<-arrange(.data=psmelt(physeq=Stack),Phylum)
+Stack$Timepoint <- factor(Stack$Timepoint,
+                                        levels=c("Before","Return","3 mo","6 mo","12 mo")) 
+ggplot(Stack, aes(x=Timepoint,y=Abundance,fill=Phylum)) +
+  facet_grid(Took.Abs~.) +
+  geom_bar(stat="identity") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=90,vjust=0.5),
+        legend.position="none") +
+  ylab("Relative Abundance \n") +
+  ggtitle("Phylum Abundance in the Human Gut")
+```
+
+## Enterobacteriaceae 
+
+These are the genus names of the Enterobacteriaceae
+
+```{r EnteroGenus}
+# Pull out the samples with the family name Enterobacteriaceae
+genusS<-subset_taxa(PS, Family %in% "Enterobacteriaceae") 
+kable(table(tax_table(genusS)[,"Genus"]),col.names=c("Genus","Frequency"))
+```
+
+Here is a stacked barplot to show the diversity, made with the genus's from the Enterobacteriaceae.
+
+
+
+```{r GenNam,eval=TRUE,fig.height=8,fig.width=10}
+BetterColors<- function(ncolors) {
+  hues<-seq(from=1,to=162,length=ncolors+1)
+  hcl(h=hues,l=65,c=100)[1:ncolors]
+}
+Stack<-tax_glom(physeq=genusS,taxrank="Genus")
+Stack<-transform_sample_counts(physeq=Stack,fun=function(x) {x/sum(x)} )
+Stack<-arrange(.data=psmelt(physeq=Stack),Genus)
+# Refactor axis
+Stack$Timepoint <- factor(Stack$Timepoint,
+                                        levels=c("Before","Return","3 mo","6 mo","12 mo")) 
+ggplot(Stack, aes(x=Timepoint,y=Abundance,fill=Genus)) +
+  facet_grid(Colonized~.) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values=rev(BetterColors(ncolors=15))) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=90,vjust=0.5),
+        legend.position="left") +
+  ylab("Relative Abundance \n") +
+  ggtitle("Enterobacteriaceae Genus Abundances in the Human Gut")
+```
+
+There is a spike in travelers classified as colonized when they returned.There appears to be more diversity in the non-colonized group.
+
+
+```{r trash}
+rm(genusS)
+```
+
+A subset could be made on the stack with only one family using **tax_glom()**, the Enterobacteriaceae. The graph shows the abundances of Enterobacteriaceae for those who didn't and those who did take antibiotics from our samples. 
+
+```{r Enterobacteriaceae,eval=TRUE,fig.height=5,fig.width=8}
+Stack<-tax_glom(physeq=PS,taxrank="Family")
+Stack<-transform_sample_counts(physeq=Stack,fun=function(x) {x/sum(x)} )
+Stack<-arrange(.data=psmelt(physeq=Stack),Family)
+Enterobacteriaceae<-subset(Stack,Family=="Enterobacteriaceae") 
+# Refactor axis
+Enterobacteriaceae$Timepoint <- factor(Enterobacteriaceae$Timepoint,
+                                        levels=c("Before","Return","3 mo","6 mo","12 mo")) 
+ggplot(Enterobacteriaceae, aes(x=Timepoint,y=Abundance,fill=Order)) +
+  facet_grid(AbdSymptoms~.) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values=rev(BetterColors(ncolors=18))) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=90,vjust=0.5),
+        legend.position="right") +
+  ylab("Relative Abundance \n") +
+  ggtitle("Enterobacteriaceae Abundance in the Human Gut")
+rm(Stack,MyPhyla)
+```
+
+There appears to be a high abundance of Enterobacteriaceae in travelers who reported abdominal symptoms when they returned, but the rest of the abundances are very low.
+
+## Proteobacteria
+
+This time **tax_glom()** will be used to subset at the phyla level.
+
+```{r PhylaStack}
+phylaPS<-tax_glom(physeq=PS,taxrank="Phylum")
+phylaPS<-transform_sample_counts(physeq=phylaPS,fun=function(x) {x/sum(x)} )
+phylaPS<-arrange(.data=psmelt(physeq=phylaPS),Phylum)
+# Refactor axis
+phylaPS$Timepoint <- factor(phylaPS$Timepoint,
+                                        levels=c("Before","Return","3 mo","6 mo","12 mo")) 
+```
+
+This shows the phyla diversity from the whole microbiome, split into categories based off if the individual's guts were colonized. 
+
+```{r ColonizedStackedBarPlot,eval=TRUE}
+ggplot(phylaPS, aes(x=Timepoint,y=Abundance,fill=Phylum)) +
+  facet_grid(Colonized~.) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values=rev(BetterColors(ncolors=18))) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=90,vjust=0.5)) +
+        #axis.text.y.left = element_blank()) +
+  ylab("Relative Abundance \n") +
+  ggtitle("Phylum Composition of the India Traveler's Guts.")
+```
+
+
+
+There seem to be a difference here at the before and return timepoints. In the non-colonized group, the phyla abundance decreases while the colonized group increases.
+
+
+Another variable could be tested. Here, the graph will show the abundance of the microbiomes at the phylum level for travelers who traveled to southeast Asia.
+
+```{r SEAsiaStackedBarPlot,eval=TRUE}
+ggplot(phylaPS, aes(x=Timepoint,y=Abundance,fill=Phylum)) +
+  facet_grid(SE.Asia~.) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values=rev(BetterColors(ncolors=18))) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=90,vjust=0.5)) +
+        #axis.text.y.left = element_blank()) +
+  ylab("Relative Abundance \n") +
+  ggtitle("Phylum Composition of the SE Asia Traveler's Guts.")
+```
+
+There also appears to be something here. At the return timepoint there is a large increase in abundance for the travelers who went to southeast Asia. 
+
+## Summarize Abundances
+
+Now, this plot shows the mean and standard deviations of Enterobacteriaceae abundances. 
+
+```{r SummarizeEnteroByAbs,eval=TRUE,fig.height=6}
+Mean<-aggregate(Abundance~Took.Abs*Timepoint,data=Enterobacteriaceae,FUN="mean")
+SD<-aggregate(Abundance~Took.Abs*Timepoint,data=Enterobacteriaceae,FUN="sd")
+MeanSD<-merge(x=Mean,y=SD,by=c("Took.Abs","Timepoint"))
+colnames(MeanSD)<-c("Took.Abs","Timepoint","Mean","Stdev")
+# Plot
+ggplot(MeanSD, aes(x=Timepoint,y=Mean,ymin=Mean-Stdev,ymax=Mean+Stdev)) +
+  geom_pointrange(mapping=aes(colour=Took.Abs)) +
+  scale_colour_manual(values=rev(BetterColors(ncolors=2))) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=90,vjust=0.5)) +
+  ylab("Relative Abundance \n") +
+  ggtitle("Mean (+/- SD) Enterobacteriaceae Abundance in the India Traveler's Gut")
+```
+
+The mean abundance for antibiotic takers is less on the graph, but it should be noted that there are far fewer samples under the antibiotic group then the non-antibiotic!
+
+Let's see what it looks like for colonized vs non-colonized individuals.
+
+```{r SummarizeByCol,eval=TRUE,fig.height=6}
+ColMean<-aggregate(Abundance~Colonized*Timepoint,data=Enterobacteriaceae,FUN="mean")
+ColSD<-aggregate(Abundance~Colonized*Timepoint,data=Enterobacteriaceae,FUN="sd")
+ColMeanSD<-merge(x=ColMean,y=ColSD,by=c("Colonized","Timepoint"))
+colnames(ColMeanSD)<-c("Colonized","Timepoint","Mean","Stdev")
+# Plot
+ggplot(ColMeanSD, aes(x=Timepoint,y=Mean,ymin=Mean-Stdev,ymax=Mean+Stdev)) +
+  geom_pointrange(mapping=aes(colour=Colonized)) +
+  scale_colour_manual(values=rev(BetterColors(ncolors=2))) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=90,vjust=0.5)) +
+  ylab("Relative Abundance \n") +
+  ggtitle("Mean (+/- SD) Enterobacteriaceae Abundance in the India Traveler's Gut")
+rm(BetterColors)
+```
+
+The mean of colonized individuals increases much more than the non-colonized group does upon returning from India.
+
+```{r Removing}
+rm(Mean,SD,MeanSD,ColMean,ColSD,ColMeanSD,Mock,MockNotZero,MyPie)
+```
+
+
+# Test for Significance
+
+Test whether there is a difference between the group that took antibiotics and the one that did not, using the Mann-Whitney test. The null hypothesis: There is no difference in median abundance of Enterobacteriaceae from individuals that took antibiotics and those that did not. $\alpha=0.02$
+
+```{r AntibioticsWilcox,eval=TRUE}
+wilcox.test(formula=Abundance~Took.Abs,data=Enterobacteriaceae,paired=F,exact=F)
+```
+
+This p value is above the threshold, so the null is accepted. There is no difference between the two groups. 
+
+
+The relationship between abundance and the colonization status should also be tested.
+The null hypothesis: There is no difference in median abundance of Enterobacteriaceae from individuals that were colonized and those that did not. $\alpha=0.02$
+
+```{r ColonizedWilcox,eval=TRUE}
+wilcox.test(formula=Abundance~Colonized,data=Enterobacteriaceae,paired=F,exact=F)
+```
+
+This looks better but not quite below the $p<0.02$ threshold.
+Another variable to try is the southeast travelers.
+
+```{r SEAsiaWilcox,eval=TRUE}
+wilcox.test(formula=Abundance~SE.Asia,data=Enterobacteriaceae,paired=F,exact=F)
+```
+
+## Permanova
+
+This is a simple univariate test on the variances using **adonis()** from the *vegan* package. [@dada2]
+
+Tested here is the RSV abundances and the colonized status. $H_o$ : There is no abudnance difference between idividuals who were classified as colonized and non-colonized.
+
+```{r Permanova}
+rm(Enterobacteriaceae)
+PS_Comp<-microbiome::transform(x=PS,transform="compositional")
+RSV_Abundances<-abundances(PS_Comp)
+Phenos<-meta(PS_Comp)
+Permanova<-adonis(t(RSV_Abundances)~Colonized,data=Phenos,permutations=999,method="bray")
+Permanova
+```
+
+This p value is not acceptable. The null hypothesis is accepted. If it was rejected this is what would be used next.
+
+```{r TestDispColon,eval=TRUE}
+PS.Bray<-distance(physeq=PS_Comp,method="bray")
+PS.Df<-data.frame(sample_data(PS))
+permutest(betadisper(d=PS.Bray,with(PS.Df,Colonized)))
+```
+
+This would also be accepted. There is no meaningful difference in the RSVs from the two groups.
+
+
+This test is the same permanova but using the southeast Asia status for testing.
+
+```{r Permanova2}
+PS_Comp<-microbiome::transform(x=PS,transform="compositional")
+RSV_Abundances<-abundances(PS_Comp)
+Phenos<-meta(PS_Comp)
+Permanova<-adonis(t(RSV_Abundances)~SE.Asia,data=Phenos,permutations=999,method="bray")
+Permanova
+```
+
+With this p value, the null will be accepted. If it could be rejected a **permutest()** would be used next to further varify that there was a difference in the southeast Asia groups.
+
+```{r SAperm,eval=TRUE}
+PS.Bray<-distance(physeq=PS_Comp,method="bray")
+PS.Df<-data.frame(sample_data(PS))
+permutest(betadisper(d=PS.Bray,with(PS.Df,SE.Asia)))
+```
+
+
+
+This is a third multivariate test on the traveler's abdominal pain status.
+
+```{r Permanova3}
+PS_Comp<-microbiome::transform(x=PS,transform="compositional")
+RSV_Abundances<-abundances(PS_Comp)
+Phenos<-meta(PS_Comp)
+Permanova<-adonis(t(RSV_Abundances)~AbdSymptoms,data=Phenos,permutations=999,method="bray")
+Permanova
+```
+
+The null hypothesis here is accepted, there is no difference. 
+If there was **permutest()** could be used to further check if there was a meaningful difference between the two groups. 
+
+```{r TestDisp,eval=TRUE}
+PS.Bray<-distance(physeq=PS_Comp,method="bray")
+PS.Df<-data.frame(sample_data(PS))
+permutest(betadisper(d=PS.Bray,with(PS.Df,AbdSymptoms)))
+```
+
+This further shows that there is no difference in the abdominal symptom groups
+
+## Investigate Alpha Diversity
+
+The next step would be to test the $\alpha$ diversity.
+
+Now we will investigate alpha diversity. Nathan made a function to help with that: 
+
+```{r AshlaneFunc}
+Func <- function (physeq, x = "samples", color = NULL, shape = NULL, 
+          title = NULL, scales = "free_y", nrow = 1, shsi = NULL, measures = NULL, 
+          sortby = NULL) 
+{
+  erDF = estimate_richness(physeq, split = TRUE, measures = measures)
+  measures = colnames(erDF)
+  ses = colnames(erDF)[grep("^se\\.", colnames(erDF))]
+  measures = measures[!measures %in% ses]
+  if (!is.null(sample_data(physeq, errorIfNULL = FALSE))) {
+    DF <- data.frame(erDF, sample_data(physeq))
+  }
+  else {
+    DF <- data.frame(erDF)
+  }
+  if (!"samples" %in% colnames(DF)) {
+    DF$samples <- sample_names(physeq)
+  }
+  if (!is.null(x)) {
+    if (x %in% c("sample", "samples", "sample_names", "sample.names")) {
+      x <- "samples"
+    }
+  }
+  else {
+    x <- "samples"
+  }
+  mdf = reshape2::melt(DF, measure.vars = measures)
+  mdf$se <- NA_integer_
+  if (length(ses) > 0) {
+    selabs = ses
+    names(selabs) <- substr(selabs, 4, 100)
+    substr(names(selabs), 1, 1) <- toupper(substr(names(selabs), 
+                                                  1, 1))
+    mdf$wse <- sapply(as.character(mdf$variable), function(i, 
+                                                           selabs) {
+      selabs[i]
+    }, selabs)
+    for (i in 1:nrow(mdf)) {
+      if (!is.na(mdf[i, "wse"])) {
+        mdf[i, "se"] <- mdf[i, (mdf[i, "wse"])]
+      }
+    }
+    mdf <- mdf[, -which(colnames(mdf) %in% c(selabs, "wse"))]
+  }
+  if (!is.null(measures)) {
+    if (any(measures %in% as.character(mdf$variable))) {
+      mdf <- mdf[as.character(mdf$variable) %in% measures, 
+      ]
+    }
+    else {
+      warning("Argument to `measures` not supported. All alpha-diversity measures (should be) included in plot.")
+    }
+  }
+  if (!is.null(shsi)) {
+    warning("shsi no longer supported option in plot_richness. Please use `measures` instead")
+  }
+  if (!is.null(sortby)) {
+    if (!all(sortby %in% levels(mdf$variable))) {
+      warning("`sortby` argument not among `measures`. Ignored.")
+    }
+    if (!is.discrete(mdf[, x])) {
+      warning("`sortby` argument provided, but `x` not a discrete variable. `sortby` is ignored.")
+    }
+    if (all(sortby %in% levels(mdf$variable)) & is.discrete(mdf[, 
+                                                                x])) {
+      wh.sortby = which(mdf$variable %in% sortby)
+      mdf[, x] <- factor(mdf[, x], levels = names(sort(tapply(X = mdf[wh.sortby, 
+                                                                      "value"], INDEX = mdf[wh.sortby, x], mean, na.rm = TRUE, 
+                                                              simplify = TRUE))))
+    }
+  }
+  richness_map = aes_string(x = x, y = "value", colour = color, 
+                            shape = shape)
+  p = ggplot(mdf, richness_map) + geom_point(na.rm = TRUE, position = position_dodge(width = 0.5)) # add this section to separate the points horizontally.
+  # Comment or remove this to delete error bars
+  
+  p = p + theme(axis.text.x = element_text(angle = -90, vjust = 0.5, 
+                                           hjust = 0))
+  p = p + ylab("Alpha Diversity Measure")
+  p = p + facet_wrap(~variable, nrow = nrow, scales = scales)
+  if (!is.null(title)) {
+    p <- p + ggtitle(title)
+  }
+  return(p)
+}
+```
+
+Here the $\alpha$ diversity will be plotted by the Chao1 and InvSimpson methods. The graph is showing the $\alpha$ diversity for the colonized and non-colonized individuals and their antibiotic usage. The hypothesis here tests if there is a difference in bacterial diversity within the samples based on if they took antibiotics
+
+```{r AlphaDiv,eval=TRUE,fig.height=10}
+AlphaDiv<-plot_richness(physeq=PS,
+                        x="Took.Abs",
+                        measures=c("Chao1","InvSimpson"),
+                        color="Colonized")
+# Refactor the X-axis "
+MyOrder<-dput(as.character(sort(as.numeric(levels(AlphaDiv[["data"]][["Timepoint"]])))))
+
+AlphaDiv[["data"]][["Timepoint"]]<-factor(AlphaDiv[["data"]][["Timepoint"]],
+                                     levels=MyOrder)
+AlphaDiv
+rm(PS_Comp,PS.DF,Phenos,Permanova)
+```
+
+## Investigating Beta Diversity
+
+$\beta$ diversity looks at the differences between samples; not within individuals. Usually this is done using ordination. Ordination is a method of simplifying multidimensional data.
+
+First thing to do is make a tree. Two more packages will be used. One is *betapart* and *ape*. First, ape is going to make the phylogenetic tree based on the phyloseq object. Then we will run **rtree()** to generate random trees to use as a comparison. [@beta] [@ape]
+
+```{r MakeTree,eval=TRUE}
+Random_Tree<-rtree(ntaxa(physeq=PS),
+                   rooted=T,
+                   tip.label=taxa_names(PS))
+PS1<-merge_phyloseq(PS,Random_Tree)
+```
+
+### Unweighted UniFrac
+
+The unweighted UniFrac distance is found using the **distance()** command. 
+The ordination is performed using the **ordinate()** command. The PCoA method will be used to make the ordination plot. 
+Ordination plot: high dimension data that has been simplified into 2 dimensions, you want the groups to be clustered (clustered groups are similar)
+
+```{r UwUni,eval=TRUE}
+U.unifrac_dist<-distance(PS1,method="unifrac",weighted=F)
+U.Ordination<-ordinate(PS1,method="PCoA",distance=U.unifrac_dist,weighted=F)
+Beta_Unweighted<-plot_ordination(physeq=PS1,
+                                  ordination=U.Ordination,
+                                  color="Colonized") +
+                                  theme(aspect.ratio=1) +
+                                  geom_point(size=2) +
+                                  ggtitle("Unweighted UniFrac Distance")
+Beta_Unweighted
+```
+
+These groups do not cluster. 
+
+```{r Fin,echo=FALSE}
+paste("Finished Compiling in ", as.integer((proc.time()-StartTime)[3]),"Seconds",sep=" ")
+```
+
+# System and Session Information
+
+This section reports the system configuration, R version, and R add-on package versions. 
+
+```{r SystemSessionInfo,eval=TRUE}
+sessionInfo()
+```
+
+
+# Bibliography
+
